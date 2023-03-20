@@ -1,4 +1,139 @@
 #!/usr/bin/make -f
+# -*- makefile -*-
+
+# Uncomment this to turn on verbose mode.
+#export DH_VERBOSE=1
+
+# This can be disabled if the bundled icu overtakes the system version,
+# or for backporting
+WITH_SYSTEM_ICU = yes
+
+DEB_HOST_ARCH  ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+DEB_HOST_GNU_TYPE  ?= $(shell dpkg-architecture -qDEB_HOST_GNU_TYPE)
+DEB_BUILD_GNU_TYPE ?= $(shell dpkg-architecture -qDEB_BUILD_GNU_TYPE)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+DEB_HOST_ARCH_ENDIAN ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_ENDIAN)
+export DEB_HOST_ARCH
+# mozjs' build process does not seem to be compatible with other shells
+# like zsh
+export SHELL = /bin/sh
+export PYTHON = python
+
+SRCDIR = $(CURDIR)/js/src
+BUILDDIR = $(CURDIR)/debian/build
+CONFIGURE_FLAGS =
+
+# ia64 currently has toolchain issues, so relax the link optimization
+# -fno-schedule-insns2 breaks gcc on ia64, so leave it enabled
+ifneq (,$(findstring $(DEB_BUILD_ARCH),ia64))
+	DEB_CFLAGS_MAINT_APPEND += -G0 -fno-lifetime-dse -fno-delete-null-pointer-checks
+	DEB_CXXFLAGS_MAINT_APPEND += -G0 -fno-lifetime-dse -fno-delete-null-pointer-checks
+else
+	DEB_CFLAGS_MAINT_APPEND += -fno-schedule-insns2 -fno-lifetime-dse -fno-delete-null-pointer-checks
+	DEB_CXXFLAGS_MAINT_APPEND += -fno-schedule-insns2 -fno-lifetime-dse -fno-delete-null-pointer-checks
+endif
+ifneq (,$(findstring $(DEB_BUILD_ARCH),armel armhf))
+        DEB_CFLAGS_MAINT_APPEND += -fno-schedule-insns
+        DEB_CXXFLAGS_MAINT_APPEND += -fno-schedule-insns
+endif
+ifneq (,$(findstring $(DEB_BUILD_ARCH),sh4))
+        DEB_CFLAGS_MAINT_APPEND += -mlra
+        DEB_CXXFLAGS_MAINT_APPEND += -mlra
+endif
+export DEB_CFLAGS_MAINT_APPEND DEB_CXXFLAGS_MAINT_APPEND
+
+ifneq (,$(findstring $(DEB_HOST_ARCH),mips mipsel mips64el))
+CONFIGURE_FLAGS += --disable-ion
+endif
+
+ifeq ($(DEB_HOST_ARCH),sh4)
+CONFIGURE_FLAGS += --disable-pie
+else
+CONFIGURE_FLAGS += --enable-pie
+endif
+
+ifeq ($(WITH_SYSTEM_ICU),yes)
+CONFIGURE_FLAGS += --with-system-icu
+else
+CONFIGURE_FLAGS += --without-system-icu
+ifeq ($(DEB_HOST_ARCH_ENDIAN),little)
+ICU_DATA_FILE = icudt60l.dat
+else
+ICU_DATA_FILE = icudt60b.dat
+endif
+export ICU_DATA_FILE
+endif
 
 %:
-	dh $@
+	dh $@ --sourcedirectory=$(SRCDIR) --builddirectory=$(BUILDDIR) --with gnome,pkgkde-symbolshelper
+
+override_dh_clean:
+	dh_clean
+	find $(CURDIR) -name \*.pyc -exec rm {} \;
+	find $(CURDIR)/js/src/ -type l -exec rm {} \;
+	rm -f $(CURDIR)/js/src/config/nsinstall
+	rm -f $(CURDIR)/js/src/dist/bin/.purgecaches
+	rm -f  $(CURDIR)/js/src/js60-config $(CURDIR)/js/src/mozjs-60.pc \
+		$(CURDIR)/js/src/symverscript
+	rm -f $(CURDIR)/js/src/config.log
+	# rm -f $(CURDIR)/js/src/configure
+	rm -fr $(CURDIR)/intl/icu/source/autom4te.cache
+	rm -fr $(CURDIR)/debian/build
+	rm -rf third_party/python/psutil/build/ third_party/python/psutil/psutil/_*.so third_party/python/psutil/tmp/
+
+override_dh_autoreconf:
+	WITH_SYSTEM_ICU=$(WITH_SYSTEM_ICU) dh_autoreconf $(CURDIR)/debian/autogen.sh
+
+# dh_auto_configure does not properly handle autoconf2.13 generated configure
+# scripts, so we call configure ourselves.
+# http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=570375
+# The bundled copy of icu prefers clang, which we need to override to
+# use gcc because clang doesn't support our DEB_CFLAGS_MAINT_APPEND
+override_dh_auto_configure:
+ifneq ($(WITH_SYSTEM_ICU),yes)
+	CC=$${CC:-$(DEB_HOST_GNU_TYPE)-gcc} \
+	CXX=$${CXX:-$(DEB_HOST_GNU_TYPE)-g++} \
+	VERBOSE=1 python intl/icu_sources_data.py "$(CURDIR)"
+endif
+	mkdir -p $(BUILDDIR)
+	cd $(BUILDDIR) && $(SHELL) $(SRCDIR)/configure \
+		--host=$(DEB_HOST_GNU_TYPE) \
+		--target=$(DEB_BUILD_GNU_TYPE) \
+		--prefix=/usr \
+		--libdir=/usr/lib/${DEB_HOST_MULTIARCH}/ \
+		--enable-posix-nspr-emulation \
+		--with-system-zlib \
+		--disable-strip \
+		--with-intl-api \
+		--enable-readline \
+		--disable-optimize \
+		--disable-jemalloc \
+		$(CONFIGURE_FLAGS)
+
+override_dh_install:
+	# move library and create additional symlinks to standardize the file layout
+	cd $(CURDIR)/debian/tmp/usr/lib/${DEB_HOST_MULTIARCH}/ && \
+		mv libjs_static.ajs libmozjs-60.a && \
+		mv libmozjs-60.so libmozjs-60.so.0.0.0 && \
+		ln -s libmozjs-60.so.0.0.0 libmozjs-60.so.0 && \
+		ln -s libmozjs-60.so.0 libmozjs-60.so
+	rm debian/tmp/usr/lib/${DEB_HOST_MULTIARCH}/libmozjs-60.a
+	dh_install
+
+override_dh_missing:
+	dh_missing --fail-missing
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod a-x $(CURDIR)/debian/libmozjs-60-dev/usr/lib/${DEB_HOST_MULTIARCH}/pkgconfig/mozjs-60.pc
+
+override_dh_gnome:
+	dh_gnome --no-gnome-versions
+
+override_dh_auto_test:
+	@:
+ifeq ($(DEB_HOST_GNU_TYPE),$(DEB_BUILD_GNU_TYPE))
+ifeq (,$(findstring nocheck,$(DEB_BUILD_OPTIONS)))
+	SRCDIR=${SRCDIR} BUILDDIR=${BUILDDIR} DEB_HOST_ARCH=${DEB_HOST_ARCH} $(CURDIR)/debian/test.sh
+endif
+endif
